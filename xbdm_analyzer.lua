@@ -26,9 +26,9 @@ local response_field = ProtoField.new("Response", "xbdm.response", ftypes.STRING
 local multiline_response_start_field = ProtoField.framenum("xbdm.multiline_response_start", "Response start")
 local multiline_response_end_field = ProtoField.framenum("xbdm.multiline_response_end", "Response end")
 
-local proto = Proto("XBDM", "Xbox debug manager dissector")
+local xbdm_dissector = Proto("XBDM", "Xbox debug manager dissector")
 
-proto.fields = {
+xbdm_dissector.fields = {
     sender_field,
     command_field,
     binary_send_start_field,
@@ -37,6 +37,17 @@ proto.fields = {
     response_field,
     multiline_response_start_field,
     multiline_response_end_field,
+}
+
+local notification_sender_field = ProtoField.string("xbdm.notification.sender", "Sender")
+local notification_command_field = ProtoField.string("xbdm.notification.command", "Command")
+local notification_debug_message_field = ProtoField.string("xbdm.notification.debug", "Debug message")
+
+local xbdm_notification_dissector = Proto("XBDM-Notification", "Xbox debug manager notification dissector")
+xbdm_notification_dissector.fields = {
+    notification_sender_field,
+    notification_command_field,
+    notification_debug_message_field,
 }
 
 
@@ -87,9 +98,57 @@ local function find_closest_previous_or_same_packet(search_table, packet_number)
 end
 
 local function starts_with(str, prefix)
-    return string.sub(str, 1, #prefix) == prefix
+    local substring = string.sub(str, 1, #prefix)
+    return string.lower(substring) == prefix
 end
 
+
+-- Holds information about a single Xbox <-> computer notification conversation.
+local NotificationConversationContext = {}
+
+function NotificationConversationContext.new(tcp_stream)
+    local ret = {
+        -- The wireshark TCP stream that this conversation is associated with.
+        tcp_stream_id = tcp_stream,
+    }
+    -- Processes the given buffer as a request from the computer -> Xbox.
+    function ret:process_notification(xbdm_data, tvb, pinfo)
+        local command = extract_command(tvb)
+        if not pinfo.visited then
+            self:first_time_process_request_packet(command, tvb, pinfo)
+        end
+
+        xbdm_data:add(notification_command_field, command)
+
+        if starts_with(command, "debugstr ") then
+            xbdm_data:add(notification_debug_message_field, string.sub(command, 10))
+        end
+    end
+
+    return ret
+end
+
+
+-- Ports which are expected to receive push data from the Xbox
+local known_notification_ports = {}
+
+local function register_notification_conversation(command)
+    -- notifyat port=1234
+    -- notifyat Port=0xff7d drop debug
+    local _, _, port_section = string.find(string.lower(command), "port=(0x%x+)")
+    if port_section == nil then
+        _, _, port_section = string.find(string.lower(command), "port=(%d+)")
+    end
+
+    if port_section == nil then
+        print("Error: Missing port")
+        return nil
+    end
+
+    local port = tonumber(port_section)
+    known_notification_ports[port] = true
+    DissectorTable.get("tcp.port"):add(port, xbdm_notification_dissector)
+end
 
 -- Holds information about a single computer <-> Xbox conversation.
 local ConversationContext = {}
@@ -242,6 +301,11 @@ function ConversationContext.new(tcp_stream)
             self.packet_to_request[tonumber(pinfo.number)] = self.packet_to_request[chain_start]
             return
         end
+
+        if starts_with(command, "notifyat port") then
+            register_notification_conversation(command)
+            return
+        end
     end
 
     -- Populates the multiline response fields for a packet.
@@ -266,13 +330,59 @@ end
 
 -- Maps tcp.stream IDs to ConversationContext instances.
 local conversations = {}
+-- Maps tcp.stream IDs to NotificationConversationContext instances.
+local notification_conversations = {}
 
 local known_xbox_ports = {
     [731] = true,
     [1731] = true,  -- Development tunnel.
 }
 
-function proto.dissector(tvb, pinfo, tree)
+function xbdm_notification_dissector.dissector(tvb, pinfo, tree)
+    -- obtain the current values the protocol fields
+    local srcport = tcp_srcport_field()
+    local dstport = tcp_dstport_field()
+    local srcip = ip_src_field()
+    local dstip = ip_dst_field()
+    local tcp_stream = tcp_stream_field()
+
+    if not (srcport and dstport and srcip and dstip and tcp_stream) then
+        return
+    end
+
+    local sender_is_xbox = known_notification_ports[dstport.value]
+    local sender_is_debugger = known_notification_ports[srcport.value]
+
+    if not sender_is_xbox and not sender_is_debugger then
+        print("Uninteresting packet " .. tostring(pinfo.number) .. " " .. tostring(srcport) .. " -> " .. tostring(dstport))
+        return
+    end
+
+    pinfo.cols.protocol:set("XBDM-Notif")
+
+    local xbdm_data = tree:add(xbdm_notification_dissector, "XBDM-Notification Data")
+    xbdm_data:add(notification_sender_field, (sender_is_debugger and "XBDM" or "XBOX"))
+
+    -- Ignore partial packets.
+    if tvb:captured_len() ~= tvb:reported_length_remaining() then
+        return
+    end
+
+    local tcp_stream_id = tcp_stream.value
+    local conversation = notification_conversations[tcp_stream_id]
+    if not conversation then
+        conversation = NotificationConversationContext.new(tcp_stream_id)
+        notification_conversations[tcp_stream_id] = conversation
+    end
+
+    if sender_is_xbox then
+        conversation:process_notification(xbdm_data, tvb, pinfo)
+    else
+        print("Unexpectedly found computer->xbox packet in notification stream " .. tostring(pinfo.number))
+    end
+end
+
+function xbdm_dissector.dissector(tvb, pinfo, tree)
     -- obtain the current values the protocol fields
     local srcport = tcp_srcport_field()
     local dstport = tcp_dstport_field()
@@ -288,13 +398,13 @@ function proto.dissector(tvb, pinfo, tree)
     local sender_is_debugger = known_xbox_ports[dstport.value]
 
     if not sender_is_xbox and not sender_is_debugger then
-        print("Uninteresting packet " .. tostring(srcport) .. " -> " .. tostring(dstport))
+        print("Uninteresting packet " .. tostring(pinfo.number) .. " " .. tostring(srcport) .. " -> " .. tostring(dstport))
         return
     end
 
     pinfo.cols.protocol:set("XBDM")
 
-    local xbdm_data = tree:add(proto, "XBDM Data")
+    local xbdm_data = tree:add(xbdm_dissector, "XBDM Data")
     xbdm_data:add(sender_field, (sender_is_debugger and "XBDM" or "XBOX"))
 
     -- Ignore partial packets.
@@ -316,5 +426,5 @@ function proto.dissector(tvb, pinfo, tree)
     end
 end
 
-DissectorTable.get("tcp.port"):add(731, proto)
-DissectorTable.get("tcp.port"):add(1731, proto)
+DissectorTable.get("tcp.port"):add(731, xbdm_dissector)
+DissectorTable.get("tcp.port"):add(1731, xbdm_dissector)
