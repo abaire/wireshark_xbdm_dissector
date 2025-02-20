@@ -17,11 +17,13 @@ local tcp_retransmission_field = Field.new('tcp.analysis.retransmission')
 -- Output fields
 local sender_field = ProtoField.string("xbdm.sender", "Sender")
 
-local command_field = ProtoField.new("Command", "xbdm.command", ftypes.STRING, frametype.REQUEST)
+local request_field = ProtoField.new("Request", "xbdm.request", ftypes.STRING, frametype.REQUEST)
+local command_field = ProtoField.string("xbdm.command", "Command")
+local notifyat_port_field = ProtoField.uint16("xbdm.command.notifyat.port", "Requested notification port")
 local binary_send_start_field = ProtoField.framenum("xbdm.binary_send_start", "Send start")
 local binary_send_end_field = ProtoField.framenum("xbdm.binary_send_end", "Send end")
 
-local request_field = ProtoField.framenum("xbdm.request_packet", "Command packet")
+local request_packet_field = ProtoField.framenum("xbdm.request_packet", "Command packet")
 local response_field = ProtoField.new("Response", "xbdm.response", ftypes.STRING, frametype.RESPONSE)
 local multiline_response_start_field = ProtoField.framenum("xbdm.multiline_response_start", "Response start")
 local multiline_response_end_field = ProtoField.framenum("xbdm.multiline_response_end", "Response end")
@@ -30,10 +32,12 @@ local xbdm_dissector = Proto("XBDM", "Xbox debug manager dissector")
 
 xbdm_dissector.fields = {
     sender_field,
+    request_field,
     command_field,
+    notifyat_port_field,
     binary_send_start_field,
     binary_send_end_field,
-    request_field,
+    request_packet_field,
     response_field,
     multiline_response_start_field,
     multiline_response_end_field,
@@ -52,7 +56,7 @@ xbdm_notification_dissector.fields = {
 
 
 -- Search a tvb for a \r\n pair.
-local function find_end_of_command(tvb, offset)
+local function find_end_of_request(tvb, offset)
     offset = offset or 0
     local max_len = math.min(512, tvb:len() - offset)
 
@@ -69,8 +73,13 @@ local function find_end_of_command(tvb, offset)
 end
 
 -- Returns a string containing the XBDM command in the given buffer or nil.
-local function extract_command(tvb, offset)
-    return tvb:range(0, find_end_of_command(tvb, offset)):string()
+local function extract_request(tvb, offset)
+    return tvb:range(offset or 0, find_end_of_request(tvb, offset)):string()
+end
+
+local function extract_first_word(command_string)
+    local _, _, word = string.find(command_string, "^([^%s]+)")
+    return word
 end
 
 -- Attempts to match up a response packet with its request.
@@ -113,15 +122,15 @@ function NotificationConversationContext.new(tcp_stream)
     }
     -- Processes the given buffer as a request from the computer -> Xbox.
     function ret:process_notification(xbdm_data, tvb, pinfo)
-        local command = extract_command(tvb)
+        local notification = extract_request(tvb)
         if not pinfo.visited then
-            self:first_time_process_request_packet(command, tvb, pinfo)
+            self:first_time_process_request_packet(notification, tvb, pinfo)
         end
 
-        xbdm_data:add(notification_command_field, command)
+        xbdm_data:add(notification_command_field, notification)
 
-        if starts_with(command, "debugstr ") then
-            xbdm_data:add(notification_debug_message_field, string.sub(command, 10))
+        if starts_with(notification, "debugstr ") then
+            xbdm_data:add(notification_debug_message_field, string.sub(notification, 10))
         end
     end
 
@@ -148,6 +157,8 @@ local function register_notification_conversation(command)
     local port = tonumber(port_section)
     known_notification_ports[port] = true
     DissectorTable.get("tcp.port"):add(port, xbdm_notification_dissector)
+
+    return port
 end
 
 -- Holds information about a single computer <-> Xbox conversation.
@@ -170,35 +181,47 @@ function ConversationContext.new(tcp_stream)
         -- initiated the send and an integer indicating how many bytes remain after the packet.
         binary_send_packets = {},
         -- Map of the packet ID that starts a multi-packet binary stream to the packet that contains the last byte.
-        binary_send_stream_end_packets = {}
+        binary_send_stream_end_packets = {},
 
+        -- Maps packet IDs that register notification ports to the decimal port they register.
+        notification_registration_packets = {},
     }
 
     -- Processes the given buffer as a request from the computer -> Xbox.
     function ret:process_request(xbdm_data, tvb, pinfo)
-        local command = extract_command(tvb)
+        local command = extract_request(tvb)
         if not pinfo.visited then
             self:first_time_process_request_packet(command, tvb, pinfo)
         end
 
         local command_field_value = self:connect_send_chain(xbdm_data, command, pinfo)
         if command_field_value then
-            xbdm_data:add(command_field, command_field_value)
+            xbdm_data:add(request_field, command_field_value)
+            xbdm_data:add(command_field, string.lower(extract_first_word(command_field_value)))
         end
 
+        local notification_port = self.notification_registration_packets[pinfo.number]
+        if notification_port ~= nil then
+            xbdm_data:add(notifyat_port_field, notification_port)
+        end
     end
 
     -- Processes the given buffer as a response from the Xbox -> computer.
     function ret:process_response(xbdm_data, tvb, pinfo)
-        local response = extract_command(tvb)
+        local response = extract_request(tvb)
         if not pinfo.visited then
             self:first_time_process_response_packet(response, tvb, pinfo)
         end
 
         local command_number, command = find_closest_previous_or_same_packet(self.packet_to_request, pinfo.number)
-        xbdm_data:add(command_field, command or "UNKNOWN")
+        if command then
+            xbdm_data:add(request_field, command)
+            xbdm_data:add(command_field, string.lower(extract_first_word(command)))
+        else
+            xbdm_data:add(request_field, "UNKNOWN")
+        end
         if command_number ~= nul then
-            xbdm_data:add(request_field, command_number)
+            xbdm_data:add(request_packet_field, command_number)
         end
         xbdm_data:add(response_field, response)
 
@@ -303,7 +326,10 @@ function ConversationContext.new(tcp_stream)
         end
 
         if starts_with(command, "notifyat port") then
-            register_notification_conversation(command)
+            local port = register_notification_conversation(command)
+            if port ~= nil then
+                self.notification_registration_packets[pinfo.number] = port
+            end
             return
         end
     end
