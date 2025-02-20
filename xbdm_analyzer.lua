@@ -130,7 +130,11 @@ function NotificationConversationContext.new(tcp_stream)
         xbdm_data:add(notification_command_field, notification)
 
         if starts_with(notification, "debugstr ") then
-            xbdm_data:add(notification_debug_message_field, string.sub(notification, 10))
+            local debug_message = string.sub(notification, 10)
+            xbdm_data:add(notification_debug_message_field, debug_message)
+            pinfo.cols.info:set("DBG:" .. debug_message)
+        else
+            pinfo.cols.info:set(notification)
         end
     end
 
@@ -198,6 +202,9 @@ function ConversationContext.new(tcp_stream)
         if command_field_value then
             xbdm_data:add(request_field, command_field_value)
             xbdm_data:add(command_field, string.lower(extract_first_word(command_field_value)))
+            pinfo.cols.info:set(command_field_value)
+        else
+            pinfo.cols.info:set("<DATA>")
         end
 
         local notification_port = self.notification_registration_packets[pinfo.number]
@@ -224,6 +231,7 @@ function ConversationContext.new(tcp_stream)
             xbdm_data:add(request_packet_field, command_number)
         end
         xbdm_data:add(response_field, response)
+        pinfo.cols.info:set(response)
 
         self:connect_response_chain(xbdm_data, pinfo)
     end
