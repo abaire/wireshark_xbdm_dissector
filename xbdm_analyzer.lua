@@ -183,6 +183,8 @@ local function register_notification_conversation(command)
     known_notification_ports[port] = true
     DissectorTable.get("tcp.port"):add(port, xbdm_notification_dissector)
 
+    -- TODO: Unregister anytime the stream is closed.
+
     return port
 end
 
@@ -527,6 +529,15 @@ function xbdm_notification_dissector.dissector(tvb, pinfo, tree)
     else
         print("Unexpectedly found computer->xbox packet in notification stream " .. tostring(pinfo.number))
     end
+end
+
+function xbdm_dissector.init()
+    conversations = {}
+    notification_conversations = {}
+    known_xbox_ports = {
+        [731] = true,
+        [1731] = true,  -- Development tunnel.
+    }
 end
 
 function xbdm_dissector.dissector(tvb, pinfo, tree)
