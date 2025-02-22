@@ -273,9 +273,9 @@ function ConversationContext.new(tcp_stream)
     -- Returns the packet number of the start of the chain, otherwise nil.
     function ret:chain_binary_send(command, tvb, pinfo)
         if starts_with(command, "sendfile") then
-            local _, _, length_str = string.find(command, "length=(0x%x+)")
+            local _, _, length_str = string.find(string.lower(command), "length=(0x%x+)")
             if length_str == nil then
-                print("Error: Missing length")
+                print("Error: Missing length in command " .. command)
                 return nil
             end
 
