@@ -19,14 +19,20 @@ local sender_field = ProtoField.string("xbdm.sender", "Sender")
 
 local request_field = ProtoField.new("Request", "xbdm.request", ftypes.STRING, frametype.REQUEST)
 local command_field = ProtoField.string("xbdm.command", "Command")
+local raw_request_field = ProtoField.bytes("xbdm.binary_request_bytes", "Data")
 local notifyat_port_field = ProtoField.uint16("xbdm.command.notifyat.port", "Requested notification port")
 local binary_send_start_field = ProtoField.framenum("xbdm.binary_send_start", "Send start")
 local binary_send_end_field = ProtoField.framenum("xbdm.binary_send_end", "Send end")
 
 local request_packet_field = ProtoField.framenum("xbdm.request_packet", "Command packet")
 local response_field = ProtoField.new("Response", "xbdm.response", ftypes.STRING, frametype.RESPONSE)
+local raw_response_field = ProtoField.bytes("xbdm.binary_response_bytes", "Data")
 local multiline_response_start_field = ProtoField.framenum("xbdm.multiline_response_start", "Response start")
 local multiline_response_end_field = ProtoField.framenum("xbdm.multiline_response_end", "Response end")
+local binary_response_start_field = ProtoField.framenum("xbdm.binary_response_start", "Response start")
+local binary_response_end_field = ProtoField.framenum("xbdm.binary_response_end", "Response end")
+
+local is_binary_field = ProtoField.bool("xbdm.is_binary", "Binary payload")
 
 local xbdm_dissector = Proto("XBDM", "Xbox debug manager dissector")
 
@@ -34,13 +40,18 @@ xbdm_dissector.fields = {
     sender_field,
     request_field,
     command_field,
+    raw_request_field,
     notifyat_port_field,
     binary_send_start_field,
     binary_send_end_field,
     request_packet_field,
     response_field,
+    raw_response_field,
     multiline_response_start_field,
     multiline_response_end_field,
+    binary_response_start_field,
+    binary_response_end_field,
+    is_binary_field,
 }
 
 local notification_sender_field = ProtoField.string("xbdm.notification.sender", "Sender")
@@ -145,14 +156,24 @@ end
 -- Ports which are expected to receive push data from the Xbox
 local known_notification_ports = {}
 
+local function parse_size_param(command, size_parameter_name)
+    command = string.lower(command)
+    local _, _, value = string.find(command, size_parameter_name .. "=(0x%x+)")
+    if value == nil then
+        _, _, value = string.find(command, size_parameter_name .. "=(%d+)")
+    end
+
+    if value == nil then
+        return nil
+    end
+
+    return tonumber(value)
+end
+
 local function register_notification_conversation(command)
     -- notifyat port=1234
     -- notifyat Port=0xff7d drop debug
-    local _, _, port_section = string.find(string.lower(command), "port=(0x%x+)")
-    if port_section == nil then
-        _, _, port_section = string.find(string.lower(command), "port=(%d+)")
-    end
-
+    local port_section = parse_size_param(command, "port")
     if port_section == nil then
         print("Error: Missing port")
         return nil
@@ -181,6 +202,11 @@ function ConversationContext.new(tcp_stream)
         -- Map of the packet ID that starts a multiline response to the packet that contains the terminator.
         multiline_response_end_packets = {},
 
+        -- Maps Xbox -> computer packet numbers to the packet number that initiated a binary response.
+        binary_response_packets = {},
+        -- Map of the packet ID that starts a binary response to the packet that contains the last byte.
+        binary_response_end_packets = {},
+
         -- set of packet IDs that are part of a binary send. Each entry will be a pair of packet ID containing the command that
         -- initiated the send and an integer indicating how many bytes remain after the packet.
         binary_send_packets = {},
@@ -204,6 +230,8 @@ function ConversationContext.new(tcp_stream)
             xbdm_data:add(command_field, string.lower(extract_first_word(command_field_value)))
             pinfo.cols.info:set(command_field_value)
         else
+            xbdm_data:add(is_binary_field, true)
+            xbdm_data:add(raw_request_field, tvb(0, tvb:captured_len()))
             pinfo.cols.info:set("<DATA>")
         end
 
@@ -216,10 +244,6 @@ function ConversationContext.new(tcp_stream)
     -- Processes the given buffer as a response from the Xbox -> computer.
     function ret:process_response(xbdm_data, tvb, pinfo)
         local response = extract_request(tvb)
-        if not pinfo.visited then
-            self:first_time_process_response_packet(response, tvb, pinfo)
-        end
-
         local command_number, command = find_closest_previous_or_same_packet(self.packet_to_request, pinfo.number)
         if command then
             xbdm_data:add(request_field, command)
@@ -230,15 +254,34 @@ function ConversationContext.new(tcp_stream)
         if command_number ~= nul then
             xbdm_data:add(request_packet_field, command_number)
         end
-        xbdm_data:add(response_field, response)
-        pinfo.cols.info:set(response)
 
-        self:connect_response_chain(xbdm_data, pinfo)
+        if not pinfo.visited then
+            self:first_time_process_response_packet(command_number, command, response, tvb, pinfo)
+        end
+
+        local response_field_value = self:connect_response_chain(xbdm_data, pinfo, response)
+        if response_field_value then
+            xbdm_data:add(response_field, response)
+            pinfo.cols.info:set(response)
+        else
+            xbdm_data:add(is_binary_field, true)
+            xbdm_data:add(raw_response_field, tvb(0, tvb:captured_len()))
+            pinfo.cols.info:set("<DATA>")
+        end
+
     end
 
     -- Processes the given packet the first time it is visited by the dissector.
-    function ret:first_time_process_response_packet(response, tvb, pinfo)
-        self:chain_multiline_response(response, tvb, pinfo)
+    function ret:first_time_process_response_packet(command_number, command, response, tvb, pinfo)
+        if self:chain_multiline_response(response, tvb, pinfo) then
+            return true
+        end
+
+        if self:chain_binary_response(command_number, command, response, tvb, pinfo) then
+            return true
+        end
+
+        return false
     end
 
     -- Add packet to multiline_response_packets if appropriate.
@@ -269,17 +312,75 @@ function ConversationContext.new(tcp_stream)
         return nil
     end
 
+    local LENGTH_PREFIXED_RESPONSE = {}
+
+    local function get_binary_response_length_from_command(command)
+        if starts_with(command, "getextcontext") then
+            return LENGTH_PREFIXED_RESPONSE
+        end
+
+        if starts_with(command, "getmem2") then
+            local binary_length = parse_size_param(command, "length")
+            if binary_length == nil then
+                print("Error: Missing length in command " .. command)
+                return nil
+            end
+            return binary_length
+        end
+
+        return nil
+    end
+
+    -- Add packet to multiline_response_packets if appropriate.
+    -- Returns the packet number of the start of the chain if appended.
+    function ret:chain_binary_response(command_number, command, response, tvb, pinfo)
+        if starts_with(response, "203") then
+            local binary_length = get_binary_response_length_from_command(command)
+            if binary_length == nil then
+                print("Error: Missing binary length for command " .. command)
+                return nil
+            end
+
+            self.binary_response_packets[pinfo.number] = table.pack(pinfo.number, binary_length)
+            return pinfo.number
+        end
+
+        local _, last_chain_info = find_closest_previous_or_same_packet(self.binary_response_packets, pinfo.number)
+        if last_chain_info == nil then
+            return nil
+        end
+
+        local last_chain_start, remaining_bytes = table.unpack(last_chain_info)
+        if remaining_bytes == 0 then
+            return nil
+        end
+
+        if remaining_bytes == LENGTH_PREFIXED_RESPONSE then
+            remaining_bytes = tonumber(tvb:range(0, 4):le_uint()) - (tvb:captured_len() - 4)
+        else
+            local is_retransmission = tcp_retransmission_field()
+            if not is_retransmission then
+                remaining_bytes = remaining_bytes - tvb:captured_len()
+            end
+        end
+
+        self.binary_response_packets[pinfo.number] = table.pack(last_chain_start, remaining_bytes)
+        if remaining_bytes == 0 then
+            self.binary_response_end_packets[last_chain_start] = pinfo.number
+        end
+        return last_chain_start
+    end
+
     -- Attempts to connect the given packet to an existing binary send request.
     -- Returns the packet number of the start of the chain, otherwise nil.
     function ret:chain_binary_send(command, tvb, pinfo)
         if starts_with(command, "sendfile") then
-            local _, _, length_str = string.find(string.lower(command), "length=(0x%x+)")
-            if length_str == nil then
+            local binary_length = parse_size_param(command, "length")
+            if binary_length == nil then
                 print("Error: Missing length in command " .. command)
                 return nil
             end
 
-            local binary_length = tonumber(length_str)
             self.binary_send_packets[pinfo.number] = table.pack(pinfo.number, binary_length)
             return pinfo.number
         end
@@ -342,8 +443,9 @@ function ConversationContext.new(tcp_stream)
         end
     end
 
-    -- Populates the multiline response fields for a packet.
-    function ret:connect_response_chain(xbdm_data, pinfo)
+    -- Populates the multiline/binary response fields for a packet.
+    -- Returns the data that should be displayed in the info column.
+    function ret:connect_response_chain(xbdm_data, pinfo, response)
         local chain_start = self.multiline_response_packets[pinfo.number]
         if chain_start ~= nil then
             if chain_start ~= pinfo.number then
@@ -353,10 +455,21 @@ function ConversationContext.new(tcp_stream)
                 xbdm_data:add(multiline_response_start_field, chain_start)
                 xbdm_data:add(multiline_response_end_field, self.multiline_response_end_packets[chain_start])
             end
-            return true
+            return response
         end
 
-        return false
+        local chain_info = self.binary_response_packets[pinfo.number]
+        if chain_info ~= nil then
+            chain_start, _ = table.unpack(chain_info)
+            if chain_start == pinfo.number then
+                return response
+            end
+            xbdm_data:add(binary_response_start_field, chain_start)
+            xbdm_data:add(binary_response_end_field, self.binary_response_end_packets[chain_start])
+            return nil
+        end
+
+        return response
     end
 
     return ret
