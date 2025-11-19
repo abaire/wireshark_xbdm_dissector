@@ -83,6 +83,24 @@ local function find_end_of_request(tvb, offset)
     end
 end
 
+-- Search a tvb for a \r\n.\r\n embedded multiline end token.
+local function find_end_of_embedded_multiline(tvb, offset)
+    offset = offset or 0
+    local max_len = math.min(1024, tvb:len() - offset)
+
+    local search_range = tvb:range(offset, max_len)
+    local data = search_range:string()
+
+    local end_offset = string.find(data, "\r\n.\r\n")
+
+    if end_offset then
+        return offset + end_offset - 1
+    else
+        return nil
+    end
+end
+
+
 -- Returns a string containing the XBDM command in the given buffer or nil.
 local function extract_request(tvb, offset)
     return tvb:range(offset or 0, find_end_of_request(tvb, offset)):string()
@@ -261,10 +279,10 @@ function ConversationContext.new(tcp_stream)
             self:first_time_process_response_packet(command_number, command, response, tvb, pinfo)
         end
 
-        local response_field_value = self:connect_response_chain(xbdm_data, pinfo, response)
+        local response_field_value = self:connect_response_chain(xbdm_data, pinfo, response, tvb)
         if response_field_value then
             xbdm_data:add(response_field, response)
-            pinfo.cols.info:set(response)
+            pinfo.cols.info:set(response_field_value)
         else
             xbdm_data:add(is_binary_field, true)
             xbdm_data:add(raw_response_field, tvb(0, tvb:captured_len()))
@@ -291,6 +309,10 @@ function ConversationContext.new(tcp_stream)
     function ret:chain_multiline_response(response, tvb, pinfo)
         if starts_with(response, "202") then
             self.multiline_response_packets[pinfo.number] = pinfo.number
+            if tvb:range(-5, 5):string() == "\r\n.\r\n" then
+                self.multiline_response_packets[pinfo.number] = -pinfo.number
+                self.multiline_response_end_packets[pinfo.number] = pinfo.number
+            end
             return pinfo.number
         end
 
@@ -447,7 +469,7 @@ function ConversationContext.new(tcp_stream)
 
     -- Populates the multiline/binary response fields for a packet.
     -- Returns the data that should be displayed in the info column.
-    function ret:connect_response_chain(xbdm_data, pinfo, response)
+    function ret:connect_response_chain(xbdm_data, pinfo, response, tvb)
         local chain_start = self.multiline_response_packets[pinfo.number]
         if chain_start ~= nil then
             if chain_start ~= pinfo.number then
@@ -456,6 +478,10 @@ function ConversationContext.new(tcp_stream)
                 end
                 xbdm_data:add(multiline_response_start_field, chain_start)
                 xbdm_data:add(multiline_response_end_field, self.multiline_response_end_packets[chain_start])
+
+                if chain_start == self.multiline_response_end_packets[chain_start] then
+                    return tvb:range(0, find_end_of_embedded_multiline(tvb, 0)):string()
+                end
             end
             return response
         end
